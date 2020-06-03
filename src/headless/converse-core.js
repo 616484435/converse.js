@@ -5,7 +5,9 @@
  */
 import './polyfill';
 import 'strophe.js/src/websocket';
-import * as strophe from 'strophe.js/src/core';
+import { Strophe, $build, $iq, $msg, $pres } from 'strophe.js/src/strophe';
+import { Connection } from '@converse/headless/connection.js';
+import { MockConnection } from '@converse/headless/mock-connection.js';
 import Storage from '@converse/skeletor/src/storage.js';
 import _ from './lodash.noconflict';
 import advancedFormat from 'dayjs/plugin/advancedFormat';
@@ -22,11 +24,6 @@ import { Router } from '@converse/skeletor/src/router.js';
 import { __, i18n } from './i18n';
 import { assignIn, debounce, invoke, isFunction, isObject, isString, pick } from 'lodash-es';
 
-const Strophe = strophe.default.Strophe;
-const $build = strophe.default.$build;
-const $iq = strophe.default.$iq;
-const $msg = strophe.default.$msg;
-const $pres = strophe.default.$pres;
 
 dayjs.extend(advancedFormat);
 
@@ -82,8 +79,6 @@ class IllegalMessage extends Error {}
 // Setting wait to 59 instead of 60 to avoid timing conflicts with the
 // webserver, which is often also set to 60 and might therefore sometimes
 // return a 504 error page instead of passing through to the BOSH proxy.
-const BOSH_WAIT = 59;
-
 const PROMISES = [
     'afterResourceBinding',
     'connectionInitialized',
@@ -233,7 +228,9 @@ export const _converse = {
     TimeoutError: TimeoutError,
     IllegalMessage: IllegalMessage,
 
-    isTestEnv: () => (Strophe.Connection.name === 'MockConnection'),
+    isTestEnv: () => {
+        return api.settings.get('bosh_service_url') === 'montague.lit/http-bind';
+    },
 
     /**
      * Translate the given string based on the current locale.
@@ -394,9 +391,9 @@ export const api = _converse.api = {
             }
 
             if (_converse.connection.reconnecting) {
-                debouncedReconnect();
+                _converse.connection.debouncedReconnect();
             } else {
-                return reconnect();
+                return _converse.connection.reconnect();
             }
         },
 
@@ -407,11 +404,7 @@ export const api = _converse.api = {
          * @returns {boolean}
          */
         isType (type) {
-            if (type.toLowerCase() === 'websocket') {
-                return _converse.connection._proto instanceof Strophe.Websocket;
-            } else if (type.toLowerCase() === 'bosh') {
-                return Strophe.BOSH && _converse.connection._proto instanceof Strophe.Bosh;
-            }
+            return _converse.connection.isType(type);
         }
     },
 
@@ -521,7 +514,9 @@ export const api = _converse.api = {
                     return _converse.startNewPreboundBOSHSession();
                 }
             }
-
+            if (api.settings.get("connection_options")?.worker && (await _converse.connection.restoreWorkerSession())) {
+                return;
+            }
             password = password || api.settings.get("password");
             const credentials = (jid && password) ? { jid, password } : null;
             attemptNonPreboundSession(credentials, automatic);
@@ -546,7 +541,7 @@ export const api = _converse.api = {
                 promise.resolve();
             }
 
-            _converse.setDisconnectionCause(_converse.LOGOUT, undefined, true);
+            _converse.connection.setDisconnectionCause(_converse.LOGOUT, undefined, true);
             if (_converse.connection !== undefined) {
                 api.listen.once('disconnected', () => complete());
                 _converse.connection.disconnect();
@@ -933,16 +928,6 @@ function replacePromise (name) {
     }
 }
 
-_converse.haveResumed = function () {
-    if (_converse.api.connection.isType('bosh')) {
-        return _converse.connfeedback.get('connection_status') === Strophe.Status.ATTACHED;
-    } else {
-        // XXX: Not binding means that the session was resumed.
-        // This seems very fragile. Perhaps a better way is possible.
-        return !_converse.connection.do_bind;
-    }
-}
-
 _converse.isUniView = function () {
     /* We distinguish between UniView and MultiView instances.
      *
@@ -1061,7 +1046,7 @@ function initClientConfig () {
 }
 
 
-async function tearDown () {
+export async function tearDown () {
     await _converse.api.trigger('beforeTearDown', {'synchronous': true});
     window.removeEventListener('click', _converse.onUserActivity);
     window.removeEventListener('focus', _converse.onUserActivity);
@@ -1075,7 +1060,8 @@ async function tearDown () {
 
 
 async function attemptNonPreboundSession (credentials, automatic) {
-    if (_converse.api.settings.get("authentication") === _converse.LOGIN) {
+    const { api } = _converse;
+    if (api.settings.get("authentication") === _converse.LOGIN) {
         // XXX: If EITHER ``keepalive`` or ``auto_login`` is ``true`` and
         // ``authentication`` is set to ``login``, then Converse will try to log the user in,
         // since we don't have a way to distinguish between wether we're
@@ -1112,12 +1098,7 @@ function connect (credentials) {
         if (!_converse.connection.reconnecting) {
             _converse.connection.reset();
         }
-        _converse.connection.connect(
-            _converse.jid.toLowerCase(),
-            null,
-            _converse.onConnectStatusChanged,
-            BOSH_WAIT
-        );
+        _converse.connection.connect(_converse.jid.toLowerCase());
     } else if (_converse.api.settings.get("authentication") === _converse.LOGIN) {
         const password = credentials ? credentials.password : (_converse.connection?.pass || _converse.api.settings.get("password"));
         if (!password) {
@@ -1125,44 +1106,22 @@ function connect (credentials) {
                 throw new Error("autoLogin: If you use auto_login and "+
                     "authentication='login' then you also need to provide a password.");
             }
-            _converse.setDisconnectionCause(Strophe.Status.AUTHFAIL, undefined, true);
+            _converse.connection.setDisconnectionCause(Strophe.Status.AUTHFAIL, undefined, true);
             _converse.api.connection.disconnect();
             return;
         }
         if (!_converse.connection.reconnecting) {
             _converse.connection.reset();
         }
-        _converse.connection.connect(_converse.jid, password, _converse.onConnectStatusChanged, BOSH_WAIT);
+        _converse.connection.connect(_converse.jid, password);
     }
 }
-
-
-async function reconnect () {
-    log.debug('RECONNECTING: the connection has dropped, attempting to reconnect.');
-    _converse.setConnectionStatus(
-        Strophe.Status.RECONNECTING,
-        __('The connection has dropped, attempting to reconnect.')
-    );
-    /**
-     * Triggered when the connection has dropped, but Converse will attempt
-     * to reconnect again.
-     *
-     * @event _converse#will-reconnect
-     */
-    _converse.api.trigger('will-reconnect');
-
-    _converse.connection.reconnecting = true;
-    await tearDown();
-    return _converse.api.user.login();
-}
-
-const debouncedReconnect = debounce(reconnect, 2000);
 
 
 _converse.shouldClearCache = () => (!_converse.config.get('trusted') || _converse.isTestEnv());
 
 
-function clearSession  () {
+export function clearSession  () {
     if (_converse.session !== undefined) {
         _converse.session.destroy();
         delete _converse.session;
@@ -1227,30 +1186,33 @@ async function discoverConnectionMethods (domain) {
 
 
 _converse.initConnection = async function (domain) {
-    if (_converse.api.settings.get("discover_connection_methods")) {
+    const api = _converse.api;
+    const XMPPConnection = _converse.isTestEnv() ? MockConnection : Connection;
+
+    if (api.settings.get("discover_connection_methods")) {
         await discoverConnectionMethods(domain);
     }
-    if (! _converse.api.settings.get('bosh_service_url')) {
-        if (_converse.api.settings.get("authentication") === _converse.PREBIND) {
+    if (! api.settings.get('bosh_service_url')) {
+        if (api.settings.get("authentication") === _converse.PREBIND) {
             throw new Error("authentication is set to 'prebind' but we don't have a BOSH connection");
         }
-        if (! _converse.api.settings.get("websocket_url")) {
+        if (! api.settings.get("websocket_url")) {
             throw new Error("initConnection: you must supply a value for either the bosh_service_url or websocket_url or both.");
         }
     }
 
-    if (('WebSocket' in window || 'MozWebSocket' in window) && _converse.api.settings.get("websocket_url")) {
-        _converse.connection = new Strophe.Connection(
-            _converse.api.settings.get("websocket_url"),
-            Object.assign(_converse.default_connection_options, _converse.api.settings.get("connection_options"))
+    if (('WebSocket' in window || 'MozWebSocket' in window) && api.settings.get("websocket_url")) {
+        _converse.connection = new XMPPConnection(
+            api.settings.get("websocket_url"),
+            Object.assign(_converse.default_connection_options, api.settings.get("connection_options"))
         );
-    } else if (_converse.api.settings.get('bosh_service_url')) {
-        _converse.connection = new Strophe.Connection(
-            _converse.api.settings.get('bosh_service_url'),
+    } else if (api.settings.get('bosh_service_url')) {
+        _converse.connection = new XMPPConnection(
+            api.settings.get('bosh_service_url'),
             Object.assign(
                 _converse.default_connection_options,
-                _converse.api.settings.get("connection_options"),
-                {'keepalive': _converse.api.settings.get("keepalive")}
+                api.settings.get("connection_options"),
+                {'keepalive': api.settings.get("keepalive")}
             )
         );
     } else {
@@ -1259,12 +1221,12 @@ _converse.initConnection = async function (domain) {
     }
     setUpXMLLogging();
     /**
-     * Triggered once the `Strophe.Connection` constructor has been initialized, which
+     * Triggered once the `Connection` constructor has been initialized, which
      * will be responsible for managing the connection to the XMPP server.
      *
      * @event _converse#connectionInitialized
      */
-    _converse.api.trigger('connectionInitialized');
+    api.trigger('connectionInitialized');
 }
 
 
@@ -1408,93 +1370,6 @@ function cleanup () {
 _converse.generateResource = () => `/converse.js-${Math.floor(Math.random()*139749528).toString()}`;
 
 
-/**
- * Callback method called by Strophe as the Strophe.Connection goes
- * through various states while establishing or tearing down a
- * connection.
- * @method _converse#onConnectStatusChanged
- * @private
- * @memberOf _converse
- */
-_converse.onConnectStatusChanged = function (status, message) {
-    log.debug(`Status changed to: ${_converse.CONNECTION_STATUS[status]}`);
-    if (status === Strophe.Status.CONNECTED || status === Strophe.Status.ATTACHED) {
-        _converse.setConnectionStatus(status);
-        // By default we always want to send out an initial presence stanza.
-        _converse.send_initial_presence = true;
-        _converse.setDisconnectionCause();
-        if (_converse.connection.reconnecting) {
-            log.debug(status === Strophe.Status.CONNECTED ? 'Reconnected' : 'Reattached');
-            onConnected(true);
-        } else {
-            log.debug(status === Strophe.Status.CONNECTED ? 'Connected' : 'Attached');
-            if (_converse.connection.restored) {
-                // No need to send an initial presence stanza when
-                // we're restoring an existing session.
-                _converse.send_initial_presence = false;
-            }
-            onConnected();
-        }
-    } else if (status === Strophe.Status.DISCONNECTED) {
-        _converse.setDisconnectionCause(status, message);
-        _converse.onDisconnected();
-    } else if (status === Strophe.Status.BINDREQUIRED) {
-        _converse.bindResource();
-    } else if (status === Strophe.Status.ERROR) {
-        _converse.setConnectionStatus(
-            status,
-            __('An error occurred while connecting to the chat server.')
-        );
-    } else if (status === Strophe.Status.CONNECTING) {
-        _converse.setConnectionStatus(status);
-    } else if (status === Strophe.Status.AUTHENTICATING) {
-        _converse.setConnectionStatus(status);
-    } else if (status === Strophe.Status.AUTHFAIL) {
-        if (!message) {
-            message = __('Your XMPP address and/or password is incorrect. Please try again.');
-        }
-        _converse.setConnectionStatus(status, message);
-        _converse.setDisconnectionCause(status, message, true);
-        _converse.onDisconnected();
-    } else if (status === Strophe.Status.CONNFAIL) {
-        let feedback = message;
-        if (message === "host-unknown" || message == "remote-connection-failed") {
-            feedback = __("Sorry, we could not connect to the XMPP host with domain: %1$s",
-                `\"${Strophe.getDomainFromJid(_converse.connection.jid)}\"`);
-        } else if (message !== undefined && message === Strophe?.ErrorCondition?.NO_AUTH_MECH) {
-            feedback = __("The XMPP server did not offer a supported authentication mechanism");
-        }
-        _converse.setConnectionStatus(status, feedback);
-        _converse.setDisconnectionCause(status, message);
-    } else if (status === Strophe.Status.DISCONNECTING) {
-        _converse.setDisconnectionCause(status, message);
-    }
-};
-
-
-_converse.setConnectionStatus = function (connection_status, message) {
-    _converse.connfeedback.set({
-        'connection_status': connection_status,
-        'message': message
-    });
-};
-
-
-/**
- * Used to keep track of why we got disconnected, so that we can
- * decide on what the next appropriate action is (in onDisconnected)
- */
-_converse.setDisconnectionCause = function (cause, reason, override) {
-    if (cause === undefined) {
-        delete _converse.disconnection_cause;
-        delete _converse.disconnection_reason;
-    } else if (_converse.disconnection_cause === undefined || override) {
-        _converse.disconnection_cause = cause;
-        _converse.disconnection_reason = reason;
-    }
-};
-
-
 function enableCarbons () {
     /* Ask the XMPP server to enable Message Carbons
      * See XEP-0280 https://xmpp.org/extensions/xep-0280.html#enabling
@@ -1519,65 +1394,7 @@ function enableCarbons () {
     _converse.connection.send(carbons_iq);
 }
 
-
-async function onConnected (reconnecting) {
-    /* Called as soon as a new connection has been established, either
-     * by logging in or by attaching to an existing BOSH session.
-     */
-    delete _converse.connection.reconnecting;
-    _converse.connection.flush(); // Solves problem of returned PubSub BOSH response not received by browser
-    await _converse.setUserJID(_converse.connection.jid);
-
-    /**
-     * Synchronous event triggered after we've sent an IQ to bind the
-     * user's JID resource for this session.
-     * @event _converse#afterResourceBinding
-     */
-    await api.trigger('afterResourceBinding', reconnecting, {'synchronous': true});
-    enableCarbons();
-
-    if (reconnecting) {
-        /**
-         * After the connection has dropped and converse.js has reconnected.
-         * Any Strophe stanza handlers (as registered via `converse.listen.stanza`) will
-         * have to be registered anew.
-         * @event _converse#reconnected
-         * @example _converse.api.listen.on('reconnected', () => { ... });
-         */
-        api.trigger('reconnected');
-    } else {
-        /**
-         * Triggered once converse.js has been initialized.
-         * See also {@link _converse#event:pluginsInitialized}.
-         * @event _converse#initialized
-         */
-        api.trigger('initialized');
-        /**
-         * Triggered after the connection has been established and Converse
-         * has got all its ducks in a row.
-         * @event _converse#initialized
-         */
-        api.trigger('connected');
-    }
-}
-
-
-async function finishDisconnection () {
-    // Properly tear down the session so that it's possible to manually connect again.
-    log.debug('DISCONNECTED');
-    delete _converse.connection.reconnecting;
-    _converse.connection.reset();
-    tearDown();
-    await clearSession();
-    delete _converse.connection;
-    /**
-     * Triggered after converse.js has disconnected from the XMPP server.
-     * @event _converse#disconnected
-     * @memberOf _converse
-     * @example _converse.api.listen.on('disconnected', () => { ... });
-     */
-    api.trigger('disconnected');
-}
+api.listen.on('afterResourceBinding', () => enableCarbons());
 
 
 function fetchLoginCredentials (wait=0) {
@@ -1657,55 +1474,6 @@ function unregisterGlobalEventHandlers () {
     document.removeEventListener("visibilitychange", _converse.saveWindowState);
     api.trigger('unregisteredGlobalEventHandlers');
 }
-
-
-/**
- * Gets called once strophe's status reaches Strophe.Status.DISCONNECTED.
- * Will either start a teardown process for converse.js or attempt
- * to reconnect.
- * @method onDisconnected
- * @private
- * @memberOf _converse
- */
-_converse.onDisconnected = function () {
-    if (api.settings.get("auto_reconnect")) {
-        const reason = _converse.disconnection_reason;
-        if (_converse.disconnection_cause === Strophe.Status.AUTHFAIL) {
-            if (api.settings.get("credentials_url") || api.settings.get("authentication") === _converse.ANONYMOUS) {
-                // If `credentials_url` is set, we reconnect, because we might
-                // be receiving expirable tokens from the credentials_url.
-                //
-                // If `authentication` is anonymous, we reconnect because we
-                // might have tried to attach with stale BOSH session tokens
-                // or with a cached JID and password
-                return api.connection.reconnect();
-            } else {
-                return finishDisconnection();
-            }
-        } else if (
-            _converse.disconnection_cause === _converse.LOGOUT ||
-            reason === Strophe.ErrorCondition.NO_AUTH_MECH ||
-            reason === "host-unknown" ||
-            reason === "remote-connection-failed"
-        ) {
-            return finishDisconnection();
-        }
-        api.connection.reconnect();
-    } else {
-        return finishDisconnection();
-    }
-};
-
-
-_converse.bindResource = async function () {
-    /**
-     * Synchronous event triggered before we send an IQ to bind the user's
-     * JID resource for this session.
-     * @event _converse#beforeResourceBinding
-     */
-    await api.trigger('beforeResourceBinding', {'synchronous': true});
-    _converse.connection.bind();
-};
 
 
 _converse.ConnectionFeedback = Model.extend({

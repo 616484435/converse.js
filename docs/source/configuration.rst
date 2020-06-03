@@ -578,6 +578,9 @@ For documentation on the configuration options that ``Strophe.Connection``
 accepts, refer to the
 `Strophe.Connection documentation <http://strophe.im/strophejs/doc/1.2.8/files/strophe-js.html#Strophe.Connection.Strophe.Connection>`_.
 
+Restricting the supported authentication mechanisms:
+****************************************************
+
 As an example, suppose you want to restrict the supported SASL authentication
 mechanisms, then you'd pass in the ``mechanisms`` as a ``connection_options``
 ``key:value`` pair:
@@ -591,6 +594,21 @@ mechanisms, then you'd pass in the ``mechanisms`` as a ``connection_options``
                 ]
             },
         });
+
+Running the XMPP Connection inside a shared worker
+**************************************************
+
+Newer versions of Strophe.js, support the ability to run the XMPP Connection
+inside a `shared worker <https://developer.mozilla.org/en-US/docs/Web/API/SharedWorker>`_ that's shared
+between open tabs in the browser in which Converse is running (and which have the same domain).
+
+
+.. code-block:: javascript
+
+        converse.initialize({
+            connection_options: { 'worker': true }
+        });
+
 
 .. _`credentials_url`:
 

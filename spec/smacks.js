@@ -1,4 +1,4 @@
-/*global mock */
+/*global mock, converse */
 
 const $iq = converse.env.$iq;
 const $msg = converse.env.$msg;
@@ -23,8 +23,7 @@ describe("XEP-0198 Stream Management", function () {
 
         await _converse.api.user.login('romeo@montague.lit/orchard', 'secret');
         const sent_stanzas = _converse.connection.sent_stanzas;
-        let stanza = await u.waitUntil(() =>
-            sent_stanzas.filter(s => (s.tagName === 'enable')).pop());
+        let stanza = await u.waitUntil(() => sent_stanzas.filter(s => (s.tagName === 'enable')).pop());
 
         expect(_converse.session.get('smacks_enabled')).toBe(false);
         expect(Strophe.serialize(stanza)).toEqual('<enable resume="true" xmlns="urn:xmpp:sm:3"/>');
