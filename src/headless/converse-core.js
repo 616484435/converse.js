@@ -293,7 +293,7 @@ function initUserSettings () {
     if (!user_settings?.fetched) {
         const id = `converse.user-settings.${_converse.bare_jid}`;
         user_settings = new Model({id});
-        user_settings.browserStorage = _converse.createStore(id);
+        user_settings.browserStorage = createStore(id);
         user_settings.fetched = user_settings.fetch({'promise': true});
     }
     return user_settings.fetched;
@@ -501,6 +501,11 @@ export const api = _converse.api = {
          *  fails to restore a previous auth'd session.
          */
         async login (jid, password, automatic=false) {
+            await _converse.initConnection();
+            if (api.settings.get("connection_options")?.worker && (await _converse.connection.restoreWorkerSession())) {
+                return;
+            }
+
             if (jid || _converse.jid) {
                 jid = await _converse.setUserJID(jid || _converse.jid);
             }
@@ -513,9 +518,6 @@ export const api = _converse.api = {
                 } else if (api.settings.get("authentication") === _converse.PREBIND && (!automatic || api.settings.get("auto_login"))) {
                     return _converse.startNewPreboundBOSHSession();
                 }
-            }
-            if (api.settings.get("connection_options")?.worker && (await _converse.connection.restoreWorkerSession())) {
-                return;
             }
             password = password || api.settings.get("password");
             const credentials = (jid && password) ? { jid, password } : null;
@@ -969,10 +971,12 @@ function initPersistentStorage () {
 }
 
 
-_converse.createStore = function (id, storage) {
+function createStore (id, storage) {
     const s = _converse.storage[storage ? storage : _converse.config.get('storage')];
     return new Storage(id, s);
 }
+
+_converse.createStore = createStore;
 
 
 function initPlugins () {
@@ -1031,7 +1035,7 @@ function initClientConfig () {
         'trusted': _converse.api.settings.get("trusted") && true || false,
         'storage': _converse.api.settings.get("trusted") ? 'persistent' : 'session'
     });
-    _converse.config.browserStorage = _converse.createStore(id, "session");
+    _converse.config.browserStorage = createStore(id, "session");
     _converse.config.fetch();
     /**
      * Triggered once the XMPP-client configuration has been initialized.
@@ -1135,59 +1139,9 @@ export function clearSession  () {
 }
 
 
-async function onDomainDiscovered (response) {
-    const text = await response.text();
-    const xrd = (new window.DOMParser()).parseFromString(text, "text/xml").firstElementChild;
-    if (xrd.nodeName != "XRD" || xrd.namespaceURI != "http://docs.oasis-open.org/ns/xri/xrd-1.0") {
-        return log.warn("Could not discover XEP-0156 connection methods");
-    }
-    const bosh_links = sizzle(`Link[rel="urn:xmpp:alt-connections:xbosh"]`, xrd);
-    const ws_links = sizzle(`Link[rel="urn:xmpp:alt-connections:websocket"]`, xrd);
-    const bosh_methods = bosh_links.map(el => el.getAttribute('href'));
-    const ws_methods = ws_links.map(el => el.getAttribute('href'));
-    // TODO: support multiple endpoints
-    _converse.api.settings.set("websocket_url", ws_methods.pop());
-    _converse.api.settings.set('bosh_service_url', bosh_methods.pop());
-    if (bosh_methods.length === 0 && ws_methods.length === 0) {
-        log.warn(
-            "onDomainDiscovered: neither BOSH nor WebSocket connection methods have been specified with XEP-0156."
-        );
-    }
-}
-
-
-async function discoverConnectionMethods (domain) {
-    // Use XEP-0156 to check whether this host advertises websocket or BOSH connection methods.
-    const options = {
-        'mode': 'cors',
-        'headers': {
-            'Accept': 'application/xrd+xml, text/xml'
-        }
-    };
-    const url = `https://${domain}/.well-known/host-meta`;
-    let response;
-    try {
-        response = await fetch(url, options);
-    } catch (e) {
-        log.error(`Failed to discover alternative connection methods at ${url}`);
-        log.error(e);
-        return;
-    }
-    if (response.status >= 200 && response.status < 400) {
-        await onDomainDiscovered(response);
-    } else {
-        log.warn("Could not discover XEP-0156 connection methods");
-    }
-}
-
-
-_converse.initConnection = async function (domain) {
+_converse.initConnection = function () {
     const api = _converse.api;
-    const XMPPConnection = _converse.isTestEnv() ? MockConnection : Connection;
 
-    if (api.settings.get("discover_connection_methods")) {
-        await discoverConnectionMethods(domain);
-    }
     if (! api.settings.get('bosh_service_url')) {
         if (api.settings.get("authentication") === _converse.PREBIND) {
             throw new Error("authentication is set to 'prebind' but we don't have a BOSH connection");
@@ -1197,6 +1151,7 @@ _converse.initConnection = async function (domain) {
         }
     }
 
+    const XMPPConnection = _converse.isTestEnv() ? MockConnection : Connection;
     if (('WebSocket' in window || 'MozWebSocket' in window) && api.settings.get("websocket_url")) {
         _converse.connection = new XMPPConnection(
             api.settings.get("websocket_url"),
@@ -1260,7 +1215,7 @@ async function initSession (jid) {
 function saveJIDtoSession (jid) {
     jid = _converse.session.get('jid') || jid;
     if (_converse.api.settings.get("authentication") !== _converse.ANONYMOUS && !Strophe.getResourceFromJid(jid)) {
-        jid = jid.toLowerCase() + _converse.generateResource();
+        jid = jid.toLowerCase() + Connection.generateResource();
     }
     _converse.jid = jid;
     _converse.bare_jid = Strophe.getBareJidFromJid(jid);
@@ -1296,10 +1251,6 @@ function saveJIDtoSession (jid) {
  * @params { String } jid
  */
 _converse.setUserJID = async function (jid) {
-    if (!_converse.connection || !u.isSameDomain(_converse.connection.jid, jid)) {
-        const domain = Strophe.getDomainFromJid(jid)
-        await _converse.initConnection(domain);
-    }
     await initSession(jid);
     /**
      * Triggered whenever the user's JID has been updated
@@ -1370,8 +1321,6 @@ function cleanup () {
     _converse.stopListening();
     _converse.off();
 }
-
-_converse.generateResource = () => `/converse.js-${Math.floor(Math.random()*139749528).toString()}`;
 
 
 function enableCarbons () {

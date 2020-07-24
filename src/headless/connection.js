@@ -1,4 +1,5 @@
 import log from "./log";
+import sizzle from 'sizzle';
 import u from '@converse/headless/utils/core';
 import { Strophe } from 'strophe.js/src/core';
 import { __ } from './i18n';
@@ -10,6 +11,10 @@ const BOSH_WAIT = 59;
 
 export class Connection extends Strophe.Connection {
 
+    static generateResource () {
+        return `/converse.js-${Math.floor(Math.random()*139749528).toString()}`;
+    }
+
     async bind () {
         /**
          * Synchronous event triggered before we send an IQ to bind the user's
@@ -20,8 +25,57 @@ export class Connection extends Strophe.Connection {
         super.bind();
     }
 
-    connect (jid, password, callback) {
-        super.connect(_converse.jid, password, callback || this.onConnectStatusChanged, BOSH_WAIT);
+
+    async onDomainDiscovered (response) {
+        const text = await response.text();
+        const xrd = (new window.DOMParser()).parseFromString(text, "text/xml").firstElementChild;
+        if (xrd.nodeName != "XRD" || xrd.namespaceURI != "http://docs.oasis-open.org/ns/xri/xrd-1.0") {
+            return log.warn("Could not discover XEP-0156 connection methods");
+        }
+        const bosh_links = sizzle(`Link[rel="urn:xmpp:alt-connections:xbosh"]`, xrd);
+        const ws_links = sizzle(`Link[rel="urn:xmpp:alt-connections:websocket"]`, xrd);
+        const bosh_methods = bosh_links.map(el => el.getAttribute('href'));
+        const ws_methods = ws_links.map(el => el.getAttribute('href'));
+        if (bosh_methods.length === 0 && ws_methods.length === 0) {
+            log.warn("Neither BOSH nor WebSocket connection methods have been specified with XEP-0156.");
+        } else {
+            // TODO: support multiple endpoints
+            api.settings.set("websocket_url", ws_methods.pop());
+            api.settings.set('bosh_service_url', bosh_methods.pop());
+            this.service = api.settings.get("websocket_url") || api.settings.get('bosh_service_url');
+        }
+    }
+
+    async discoverConnectionMethods (domain) {
+        // Use XEP-0156 to check whether this host advertises websocket or BOSH connection methods.
+        const options = {
+            'mode': 'cors',
+            'headers': {
+                'Accept': 'application/xrd+xml, text/xml'
+            }
+        };
+        const url = `https://${domain}/.well-known/host-meta`;
+        let response;
+        try {
+            response = await fetch(url, options);
+        } catch (e) {
+            log.error(`Failed to discover alternative connection methods at ${url}`);
+            log.error(e);
+            return;
+        }
+        if (response.status >= 200 && response.status < 400) {
+            await this.onDomainDiscovered(response);
+        } else {
+            log.warn("Could not discover XEP-0156 connection methods");
+        }
+    }
+
+    async connect (jid, password, callback) {
+        if (api.settings.get("discover_connection_methods")) {
+            const domain = Strophe.getDomainFromJid(jid);
+            await this.discoverConnectionMethods(domain);
+        }
+        super.connect(jid, password, callback || this.onConnectStatusChanged, BOSH_WAIT);
     }
 
     async reconnect () {
@@ -36,11 +90,11 @@ export class Connection extends Strophe.Connection {
         *
         * @event _converse#will-reconnect
         */
-        _converse.api.trigger('will-reconnect');
+        api.trigger('will-reconnect');
 
         this.reconnecting = true;
         await tearDown();
-        return _converse.api.user.login();
+        return api.user.login();
     }
 
     /**
@@ -167,7 +221,6 @@ export class Connection extends Strophe.Connection {
             this.worker_attach_promise?.resolve(false);
 
         } else if (status === Strophe.Status.CONNECTED || status === Strophe.Status.ATTACHED) {
-
             if (this.worker_attach_promise.isResolved && this.status === Strophe.Status.ATTACHED) {
                 // A different tab must have attached, so nothing to do for us here.
                 return;
