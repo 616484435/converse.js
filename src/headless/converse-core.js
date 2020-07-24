@@ -1122,13 +1122,9 @@ _converse.shouldClearCache = () => (!_converse.config.get('trusted') || _convers
 
 
 export function clearSession  () {
-    if (_converse.session !== undefined) {
-        _converse.session.destroy();
-        delete _converse.session;
-    }
-    if (_converse.shouldClearCache()) {
-        _converse.api.user.settings.clear();
-    }
+    _converse.session?.destroy();
+    delete _converse.session;
+    _converse.shouldClearCache() && _converse.api.user.settings.clear();
     /**
      * Synchronouse event triggered once the user session has been cleared,
      * for example when the user has logged out or when Converse has
@@ -1231,13 +1227,18 @@ _converse.initConnection = async function (domain) {
 
 
 async function initSession (jid) {
+    const is_shared_session = api.settings.get('connection_options').worker;
+
     const bare_jid = Strophe.getBareJidFromJid(jid).toLowerCase();
     const id = `converse.session-${bare_jid}`;
-    if (!_converse.session || _converse.session.get('id') !== id) {
+    if (_converse.session?.get('id') !== id) {
         _converse.session = new Model({id});
-        _converse.session.browserStorage = _converse.createStore(id, "session");
+        _converse.session.browserStorage = createStore(id, is_shared_session ? "persistent" : "session");
         await new Promise(r => _converse.session.fetch({'success': r, 'error': r}));
-        if (_converse.session.get('active')) {
+
+        if (!is_shared_session && _converse.session.get('active')) {
+            // If the `active` flag is set, it means this tab was cloned from
+            // another (e.g. via middle-click), and its session data was copied over.
             _converse.session.clear();
             _converse.session.save({id});
         }
@@ -1270,6 +1271,9 @@ function saveJIDtoSession (jid) {
        'bare_jid': _converse.bare_jid,
        'resource': _converse.resource,
        'domain': _converse.domain,
+        // We use the `active` flag to determine whether we should use the values from sessionStorage.
+        // When "cloning" a tab (e.g. via middle-click), the `active` flag will be set and we'll create
+        // a new empty user session, otherwise it'll be false and we can re-use the user session.
        'active': true
     });
     // Set JID on the connection object so that when we call `connection.bind`
